@@ -1,17 +1,16 @@
 use crate::container::Container;
+use crate::docker;
 use crate::widget::Widgets;
-use std::process::Command;
 
 pub struct App {
     pub containers: Vec<Container>,
     pub active_container: usize,
     pub active_widget: Widgets,
     pub scroll_offset: usize,
-    // plus your logs fields: container_logs, logs_scroll_offset, ...
 }
 
 impl App {
-    pub fn new() -> Self {
+    pub async fn new() -> Self {
         let mut app = Self {
             containers: Vec::new(),
             active_container: 0,
@@ -19,39 +18,24 @@ impl App {
             scroll_offset: 0,
         };
 
-        app.get_containers();
-
-        if !app.containers.is_empty() {
-            app.current_container_mut().get_logs();
-        }
+        app.get_containers().await;
+        app.refresh_logs().await;
 
         app
     }
 
-    pub fn get_containers(&mut self) {
-        let Ok(output) = Command::new("docker")
-            .args([
-                "ps",
-                "-a",
-                "--format",
-                "{{.ID}}|{{.Image}}|{{.Status}}|{{.Names}}",
-            ])
-            .output()
-        else {
+    pub async fn get_containers(&mut self) {
+        self.containers = docker::fetch_containers().await;
+    }
+
+    pub async fn refresh_logs(&mut self) {
+        if self.containers.is_empty() {
             return;
-        };
+        }
 
-        let stdout = String::from_utf8_lossy(&output.stdout);
-
-        let mut containers: Vec<Container> = stdout
-            .lines()
-            .filter(|line| !line.is_empty())
-            .map(Container::new)
-            .collect();
-
-        containers.sort_by_key(|c| (!c.status.starts_with("Up"), c.status.clone()));
-
-        self.containers = containers;
+        let id = self.current_container().id.clone();
+        let logs = docker::fetch_logs(&id).await;
+        self.current_container_mut().logs = logs;
     }
 
     pub fn current_container(&self) -> &Container {
@@ -62,42 +46,42 @@ impl App {
         &mut self.containers[self.active_container]
     }
 
-    fn select_container(&mut self, idx: usize) {
+    async fn select_container(&mut self, idx: usize) {
         self.active_container = idx;
         self.scroll_offset = 0;
-        self.current_container_mut().get_logs();
+        self.refresh_logs().await;
     }
 
-    pub fn next_container(&mut self) {
+    pub async fn next_container(&mut self) {
         if !self.containers.is_empty() {
             let idx = (self.active_container + 1) % self.containers.len();
-            self.select_container(idx);
+            self.select_container(idx).await;
         }
     }
 
-    pub fn previous_container(&mut self) {
+    pub async fn previous_container(&mut self) {
         if !self.containers.is_empty() {
             let idx = self
                 .active_container
                 .checked_sub(1)
                 .unwrap_or(self.containers.len() - 1);
-            self.select_container(idx);
+            self.select_container(idx).await;
         }
     }
 
-    pub fn set_container(&mut self, id: usize) {
+    pub async fn set_container(&mut self, id: usize) {
         if id < self.containers.len() {
-            self.select_container(id);
+            self.select_container(id).await;
         }
     }
 
-    pub fn refresh(&mut self) -> std::io::Result<()> {
+    pub async fn refresh(&mut self) -> std::io::Result<()> {
         let old_id = self
             .containers
             .get(self.active_container)
             .map(|c| c.id.clone());
 
-        self.get_containers();
+        self.get_containers().await;
 
         if self.containers.is_empty() {
             self.active_container = 0;
@@ -109,7 +93,7 @@ impl App {
             .and_then(|id| self.containers.iter().position(|c| c.id == id))
             .unwrap_or(self.active_container.min(self.containers.len() - 1));
 
-        self.current_container_mut().get_logs();
+        self.refresh_logs().await;
 
         Ok(())
     }

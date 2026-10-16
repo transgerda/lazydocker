@@ -1,10 +1,12 @@
 mod app;
 mod container;
+mod docker;
 mod widget;
 
 use app::App;
 use arboard::Clipboard;
-use crossterm::event::{self, Event, KeyCode};
+use crossterm::event::{self, Event, EventStream, KeyCode};
+use futures_util::StreamExt;
 use notify_rust::Notification;
 use ratatui::{
     DefaultTerminal, Frame,
@@ -13,80 +15,109 @@ use ratatui::{
     text::{Line, Span, Text},
     widgets::{Block, BorderType::Rounded, Borders, List, ListItem, ListState, Paragraph},
 };
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use widget::Widgets;
 
-fn main() -> color_eyre::Result<()> {
+#[tokio::main(flavor = "current_thread")]
+async fn main() -> color_eyre::Result<()> {
     color_eyre::install()?;
-    ratatui::run(app)?;
+    let mut terminal = ratatui::init();
+    let result = app(&mut terminal).await;
+    ratatui::restore();
+    result?;
     Ok(())
 }
 
-fn app(terminal: &mut DefaultTerminal) -> std::io::Result<()> {
-    let mut app = App::new();
+async fn app(terminal: &mut DefaultTerminal) -> std::io::Result<()> {
+    let mut app = App::new().await;
 
     let refresh_interval = Duration::from_millis(250);
-    let mut last_refresh = Instant::now();
+    let mut ticker = tokio::time::interval(refresh_interval);
+    let mut events = EventStream::new();
 
     loop {
-        terminal.draw(|frame| render(frame, &app))?;
+        terminal.draw(|frame| render(frame, &mut app))?;
 
-        if last_refresh.elapsed() >= refresh_interval {
-            app.refresh()?;
-            app.current_container_mut().get_logs();
-            last_refresh = Instant::now();
-        }
+        tokio::select! {
+            _ = ticker.tick() => {
+                app.refresh().await?;
+            }
 
-        if let Event::Key(key) = event::read()? {
-            match key.code {
-                KeyCode::Char('q') => break,
-                KeyCode::Esc => break,
+            maybe_event = events.next() => {
+                let Some(Ok(Event::Key(key))) = maybe_event else {
+                    continue;
+                };
 
-                KeyCode::Char('c') if key.modifiers.contains(event::KeyModifiers::CONTROL) => break,
-                KeyCode::Char('d') if key.modifiers.contains(event::KeyModifiers::CONTROL) => break,
+                match key.code {
+                    KeyCode::Char('q') => break,
+                    KeyCode::Esc => break,
 
-                KeyCode::Char('1') => app.active_widget = Widgets::Containers,
-                KeyCode::Char('2') => app.active_widget = Widgets::TTY,
-                KeyCode::Char('3') => app.active_widget = Widgets::Logs,
+                    KeyCode::Char('c') if key.modifiers.contains(event::KeyModifiers::CONTROL) => break,
+                    KeyCode::Char('d') if key.modifiers.contains(event::KeyModifiers::CONTROL) => break,
 
-                KeyCode::Char('h') => app.active_widget = app.active_widget.prev(),
-                KeyCode::Char('l') => app.active_widget = app.active_widget.next(),
-                KeyCode::Left => app.active_widget = app.active_widget.prev(),
-                KeyCode::Right => app.active_widget = app.active_widget.next(),
+                    KeyCode::Char('1') => app.active_widget = Widgets::Containers,
+                    KeyCode::Char('2') => app.active_widget = Widgets::TTY,
+                    KeyCode::Char('3') => app.active_widget = Widgets::Logs,
 
-                KeyCode::Char('S') => {
-                    app.current_container().stop_container();
-                }
+                    KeyCode::Char('h') => app.active_widget = app.active_widget.prev(),
+                    KeyCode::Char('l') => app.active_widget = app.active_widget.next(),
+                    KeyCode::Left => app.active_widget = app.active_widget.prev(),
+                    KeyCode::Right => app.active_widget = app.active_widget.next(),
 
-                KeyCode::Char('s') => {
-                    app.current_container().start_container();
-                }
-
-                KeyCode::Char('R') => {
-                    app.current_container().restart_container();
-                }
-
-                // Manually refresh
-                KeyCode::Char('r') => {
-                    app.get_containers();
-
-                    // Make sure selection is still valid
-                    if app.containers.is_empty() {
-                        app.active_container = 0;
-                    } else if app.active_container >= app.containers.len() {
-                        app.active_container = app.containers.len() - 1;
+                    KeyCode::Char('S') => {
+                        docker::stop(&app.current_container().id).await;
                     }
 
-                    app.scroll_offset = 0;
-                }
+                    KeyCode::Char('s') => {
+                        docker::start(&app.current_container().id).await;
+                    }
 
-                KeyCode::Char('j') | KeyCode::Char('J') | KeyCode::Down => {
-                    match app.active_widget {
+                    KeyCode::Char('R') => {
+                        docker::restart(&app.current_container().id).await;
+                    }
+
+                    // Manually refresh
+                    KeyCode::Char('r') => {
+                        app.get_containers().await;
+
+                        // Make sure selection is still valid
+                        if app.containers.is_empty() {
+                            app.active_container = 0;
+                        } else if app.active_container >= app.containers.len() {
+                            app.active_container = app.containers.len() - 1;
+                        }
+
+                        app.scroll_offset = 0;
+                    }
+
+                    KeyCode::Char('j') | KeyCode::Char('J') | KeyCode::Down => {
+                        match app.active_widget {
+                            Widgets::Containers => {
+                                if !key.modifiers.contains(event::KeyModifiers::SHIFT) {
+                                    app.next_container().await;
+                                } else {
+                                    app.scroll_down_logs(10);
+                                }
+                            }
+
+                            Widgets::TTY => {}
+
+                            Widgets::Logs => {
+                                if !key.modifiers.contains(event::KeyModifiers::SHIFT) {
+                                    app.scroll_down_logs(1);
+                                } else {
+                                    app.scroll_down_logs(10);
+                                }
+                            }
+                        }
+                    }
+
+                    KeyCode::Char('k') | KeyCode::Char('K') | KeyCode::Up => match app.active_widget {
                         Widgets::Containers => {
                             if !key.modifiers.contains(event::KeyModifiers::SHIFT) {
-                                app.next_container();
+                                app.previous_container().await;
                             } else {
-                                app.scroll_down_logs(10);
+                                app.scroll_up_logs(10);
                             }
                         }
 
@@ -94,106 +125,87 @@ fn app(terminal: &mut DefaultTerminal) -> std::io::Result<()> {
 
                         Widgets::Logs => {
                             if !key.modifiers.contains(event::KeyModifiers::SHIFT) {
-                                app.scroll_down_logs(1);
+                                app.scroll_up_logs(1);
                             } else {
-                                app.scroll_down_logs(10);
+                                app.scroll_up_logs(10);
                             }
                         }
-                    }
+                    },
+
+                    KeyCode::Char('g') | KeyCode::Char('G') => match app.active_widget {
+                        Widgets::Containers => {
+                            if !key.modifiers.contains(event::KeyModifiers::SHIFT) {
+                                app.set_container(0).await;
+                            } else {
+                                app.set_container(app.containers.len().saturating_sub(1)).await;
+                            }
+                        }
+
+                        Widgets::TTY => {}
+
+                        Widgets::Logs => {
+                            if !key.modifiers.contains(event::KeyModifiers::SHIFT) {
+                                app.scroll_offset = 0;
+                            } else {
+                                app.refresh_logs().await;
+                                let max_offset = app
+                                    .current_container()
+                                    .logs
+                                    .lines()
+                                    .count()
+                                    .saturating_sub(1);
+                                app.scroll_offset = max_offset;
+                            }
+                        }
+                    },
+
+                    KeyCode::Char('d') => match app.active_widget {
+                        Widgets::Containers => {}
+
+                        Widgets::TTY => {}
+
+                        Widgets::Logs => {
+                            app.scroll_up_logs(10);
+                        }
+                    },
+
+                    KeyCode::Char('u') => match app.active_widget {
+                        Widgets::Containers => {}
+
+                        Widgets::TTY => {}
+
+                        Widgets::Logs => {
+                            app.scroll_up_logs(10);
+                        }
+                    },
+
+                    KeyCode::Char('y') => match app.active_widget {
+                        Widgets::Containers => {
+                            let mut clipboard =
+                                Clipboard::new().map_err(|e| std::io::Error::other(e.to_string()))?;
+
+                            let id = &app.containers[app.active_container].id;
+                            clipboard
+                                .set_text(id)
+                                .map_err(|e| std::io::Error::other(e.to_string()))?;
+
+                            Notification::new()
+                                .summary("Copied to clipboard")
+                                .body(&format!(
+                                    "Container id: {}",
+                                    app.containers[app.active_container].id
+                                ))
+                                .show()
+                                .unwrap();
+                        }
+
+                        Widgets::TTY => {}
+
+                        Widgets::Logs => {}
+                    },
+
+                    _ => {}
                 }
-
-                KeyCode::Char('k') | KeyCode::Char('K') | KeyCode::Up => match app.active_widget {
-                    Widgets::Containers => {
-                        if !key.modifiers.contains(event::KeyModifiers::SHIFT) {
-                            app.previous_container();
-                        } else {
-                            app.scroll_up_logs(10);
-                        }
-                    }
-
-                    Widgets::TTY => {}
-
-                    Widgets::Logs => {
-                        if !key.modifiers.contains(event::KeyModifiers::SHIFT) {
-                            app.scroll_up_logs(1);
-                        } else {
-                            app.scroll_up_logs(10);
-                        }
-                    }
-                },
-
-                KeyCode::Char('g') | KeyCode::Char('G') => match app.active_widget {
-                    Widgets::Containers => {
-                        if !key.modifiers.contains(event::KeyModifiers::SHIFT) {
-                            app.set_container(0);
-                        } else {
-                            app.set_container(app.containers.len().saturating_sub(1));
-                        }
-                    }
-
-                    Widgets::TTY => {}
-
-                    Widgets::Logs => {
-                        if !key.modifiers.contains(event::KeyModifiers::SHIFT) {
-                            app.scroll_offset = 0;
-                        } else {
-                            let max_offset = app
-                                .current_container_mut()
-                                .get_logs()
-                                .lines()
-                                .count()
-                                .saturating_sub(1);
-                            app.scroll_offset = max_offset;
-                        }
-                    }
-                },
-
-                KeyCode::Char('d') => match app.active_widget {
-                    Widgets::Containers => {}
-
-                    Widgets::TTY => {}
-
-                    Widgets::Logs => {
-                        app.scroll_up_logs(10);
-                    }
-                },
-
-                KeyCode::Char('u') => match app.active_widget {
-                    Widgets::Containers => {}
-
-                    Widgets::TTY => {}
-
-                    Widgets::Logs => {
-                        app.scroll_up_logs(10);
-                    }
-                },
-
-                KeyCode::Char('y') => match app.active_widget {
-                    Widgets::Containers => {
-                        let mut clipboard =
-                            Clipboard::new().map_err(|e| std::io::Error::other(e.to_string()))?;
-
-                        let id = &app.containers[app.active_container].id;
-                        clipboard
-                            .set_text(id)
-                            .map_err(|e| std::io::Error::other(e.to_string()))?;
-
-                        Notification::new()
-                            .summary("Copied to clipboard")
-                            .body(&format!(
-                                "Container id: {}",
-                                app.containers[app.active_container].id
-                            ))
-                            .show()
-                            .unwrap();
-                    }
-
-                    Widgets::TTY => {}
-
-                    Widgets::Logs => {}
-                },
-
-                _ => {}
             }
         }
     }
@@ -201,7 +213,7 @@ fn app(terminal: &mut DefaultTerminal) -> std::io::Result<()> {
     Ok(())
 }
 
-fn render(frame: &mut Frame, app: &App) {
+fn render(frame: &mut Frame, app: &mut App) {
     let outer = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Min(0), Constraint::Length(1)])
@@ -290,6 +302,7 @@ fn render(frame: &mut Frame, app: &App) {
     let max_scroll = total.saturating_sub(visible);
 
     let from_bottom = app.scroll_offset.min(max_scroll as usize) as u16;
+    app.scroll_offset = from_bottom as usize;
     let scroll = max_scroll - from_bottom;
 
     let logs_widget = Paragraph::new(app.current_container().logs.clone())
